@@ -1,0 +1,1 @@
+gen.exe input.png 5828 4371 > out.txt

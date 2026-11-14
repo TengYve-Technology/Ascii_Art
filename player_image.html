@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>字符画查看器 · 可缩放</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #fff; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+
+  /* 画布容器：用于居中缩放后的画布，不裁剪 */
+  #canvasWrap {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 1;
+  }
+  #cv {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #000;
+    transition: transform 0.06s ease-out;
+    transform-origin: center center;
+    pointer-events: auto;
+    box-shadow: 0 0 0 1px #333;
+  }
+
+  /* 固定顶部工具栏 */
+  #ui {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    color: #ddd;
+    background: #1a1a1a;
+    padding: 8px 14px;
+    z-index: 10;
+    border-bottom: 1px solid #333;
+    box-sizing: border-box;
+    min-height: 48px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.6);
+  }
+  #ui button, #ui label { cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+  #ui input[type="checkbox"] { accent-color: #4af; }
+  #status { margin-left: auto; white-space: nowrap; color: #8af; font-size: 12px; }
+  #zoomHint {
+    position: fixed;
+    bottom: 16px;
+    right: 20px;
+    background: rgba(0,0,0,0.7);
+    color: #aaa;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-family: system-ui, sans-serif;
+    font-size: 12px;
+    z-index: 9;
+    border: 1px solid #333;
+    pointer-events: none;
+    backdrop-filter: blur(4px);
+  }
+  #drop {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.7); color: #fff; font-size: 20px; z-index: 20; pointer-events: none;
+    border: 3px dashed #4af;
+    font-family: system-ui, sans-serif;
+  }
+  #drop.show { display: flex; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <input type="file" id="file" accept=".txt">
+  <label>反色 <input type="checkbox" id="invert"></label>
+  <label title="开启后用鼠标滚轮缩放查看细节">
+    <span>缩放</span>
+    <input type="range" id="zoomSlider" min="10" max="800" value="100" style="width:100px;">
+    <span id="zoomLabel">100%</span>
+  </label>
+  <button id="resetZoomBtn" title="恢复适应窗口">适应窗口</button>
+  <button id="zoomInBtn" title="放大">＋</button>
+  <button id="zoomOutBtn" title="缩小">－</button>
+  <span id="status">选择一个字符画 txt（或拖进来）</span>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="cv"></canvas>
+</div>
+
+<div id="zoomHint">🖱️ 滚轮缩放 · 拖动移动</div>
+<div id="drop">松开以加载 txt</div>
+
+<script>
+"use strict";
+
+const RAMP = "@%#*+=-:. |/\\_~<>^ ";
+
+const state = {
+  lines: null, cols: 0, rows: 0,
+  ctx: null, imgData: null, imgU32: null,
+  canvasW: 0, canvasH: 0,
+  invert: false,
+
+  zoom: 1.0,
+  offsetX: 0,
+  offsetY: 0,
+  fitMode: true,
+};
+
+const statusEl = document.getElementById("status");
+const fileInput = document.getElementById("file");
+const invertInput = document.getElementById("invert");
+const canvasEl = document.getElementById("cv");
+const dropEl = document.getElementById("drop");
+const canvasWrap = document.getElementById("canvasWrap");
+const zoomSlider = document.getElementById("zoomSlider");
+const zoomLabel = document.getElementById("zoomLabel");
+const resetZoomBtn = document.getElementById("resetZoomBtn");
+const zoomInBtn = document.getElementById("zoomInBtn");
+const zoomOutBtn = document.getElementById("zoomOutBtn");
+
+function charToGray(ch) {
+  const i = RAMP.indexOf(ch);
+  if (i < 0) return 0;
+  return Math.round(255 * (1 - i / (RAMP.length - 1)));
+}
+
+function setupCanvas() {
+  state.canvasW = state.cols;
+  state.canvasH = state.rows;
+  canvasEl.width = state.canvasW;
+  canvasEl.height = state.canvasH;
+  const ctx = canvasEl.getContext("2d", { alpha: false });
+  ctx.imageSmoothingEnabled = false;
+  state.ctx = ctx;
+  const img = ctx.createImageData(state.canvasW, state.canvasH);
+  state.imgData = img;
+  state.imgU32 = new Uint32Array(img.data.buffer);
+}
+
+function render() {
+  const W = state.cols, H = state.rows;
+  const out = state.imgU32;
+  const lines = state.lines;
+  const inv = state.invert;
+  for (let y = 0; y < H; y++) {
+    const line = lines[y];
+    const rowBase = y * W;
+    for (let x = 0; x < W; x++) {
+      const ch = line.charCodeAt(x) ? line[x] : " ";
+      let g = charToGray(ch);
+      if (inv) g = 255 - g;
+      out[rowBase + x] = 0xFF000000 | (g << 16) | (g << 8) | g;
+    }
+  }
+  state.ctx.putImageData(state.imgData, 0, 0);
+}
+
+function parseTxt(text) {
+  let lines = text.split(/\r?\n/);
+  while (lines.length > 0 && lines[lines.length - 1].length === 0) lines.pop();
+  if (lines.length === 0) throw new Error("空文件");
+  let cols = 0;
+  for (const l of lines) if (l.length > cols) cols = l.length;
+  if (cols === 0) throw new Error("无字符");
+  const fixed = new Array(lines.length);
+  for (let i = 0; i < lines.length; i++)
+    fixed[i] = lines[i].length === cols ? lines[i] : lines[i] + " ".repeat(cols - lines[i].length);
+  return { lines: fixed, cols, rows: lines.length };
+}
+
+function loadTxt(text, name) {
+  try {
+    const { lines, cols, rows } = parseTxt(text);
+    state.lines = lines; state.cols = cols; state.rows = rows;
+    setupCanvas();
+    render();
+    state.fitMode = true;
+    state.zoom = 1.0;
+    state.offsetX = 0;
+    state.offsetY = 0;
+    updateZoomUI();
+    applyView();
+    statusEl.textContent = `${cols}×${rows} 像素 | ${name}`;
+    console.log("loaded", name, cols + "x" + rows);
+  } catch (e) {
+    statusEl.textContent = "解析失败: " + e.message;
+    console.error(e);
+  }
+}
+
+function getFitScale() {
+  if (!state.cols || !state.rows) return 1;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight - 48;
+  if (vw <= 0 || vh <= 0) return 1;
+  return Math.min(vw / state.cols, vh / state.rows);
+}
+
+let baseFitScale = 1;
+
+function updateBaseFitScale() {
+  baseFitScale = getFitScale();
+}
+
+function getEffectiveScale() {
+  return baseFitScale * state.zoom;
+}
+
+function applyView() {
+  if (!state.cols || !state.rows) return;
+
+  updateBaseFitScale();
+
+  let effScale;
+  if (state.fitMode) {
+    state.zoom = 1;
+    state.offsetX = 0;
+    state.offsetY = 0;
+    effScale = baseFitScale;
+    zoomSlider.value = 100;
+    zoomLabel.textContent = '100%';
+  } else {
+    effScale = baseFitScale * state.zoom;
+    if (effScale < 0.01) effScale = 0.01;
+    const percent = Math.round(state.zoom * 100);
+    zoomSlider.value = Math.min(800, Math.max(10, percent));
+    zoomLabel.textContent = percent + '%';
+  }
+
+  const displayW = state.cols * effScale;
+  const displayH = state.rows * effScale;
+  canvasEl.style.width = displayW + 'px';
+  canvasEl.style.height = displayH + 'px';
+  canvasEl.style.transform = `translate(${state.offsetX}px, ${state.offsetY}px)`;
+  canvasEl.style.maxWidth = 'none';
+  canvasEl.style.maxHeight = 'none';
+}
+
+function resetToFit() {
+  state.fitMode = true;
+  state.zoom = 1.0;
+  state.offsetX = 0;
+  state.offsetY = 0;
+  applyView();
+  updateZoomUI();
+}
+function updateZoomUI() {
+  if (state.fitMode) {
+    zoomSlider.value = 100;
+    zoomLabel.textContent = '100%';
+  } else {
+    const percent = Math.round(state.zoom * 100);
+    zoomSlider.value = Math.min(800, Math.max(10, percent));
+    zoomLabel.textContent = percent + '%';
+  }
+}
+
+window.addEventListener('resize', () => {
+  if (!state.lines) return;
+  if (state.fitMode) {
+    state.zoom = 1;
+    state.offsetX = 0;
+    state.offsetY = 0;
+    applyView();
+    updateZoomUI();
+  } else {
+    applyView();
+    updateZoomUI();
+  }
+});
+
+function handleWheel(e) {
+  if (!state.lines) return;
+  e.preventDefault();
+  if (state.fitMode) {
+    state.fitMode = false;
+    state.zoom = 1.0;
+    state.offsetX = 0;
+    state.offsetY = 0;
+  }
+  const rect = canvasEl.getBoundingClientRect();
+  const canvasCenterX = rect.left + rect.width / 2;
+  const canvasCenterY = rect.top + rect.height / 2;
+  const mouseX = e.clientX;
+  const mouseY = e.clientY;
+  const dx = mouseX - canvasCenterX;
+  const dy = mouseY - canvasCenterY;
+  const oldScale = baseFitScale * state.zoom;
+  const delta = e.deltaY < 0 ? 1.15 : 0.87;
+  let newZoom = state.zoom * delta;
+  const minZoom = 0.1;
+  const maxZoom = 20.0;
+  newZoom = Math.min(maxZoom, Math.max(minZoom, newZoom));
+  const newScale = baseFitScale * newZoom;
+  const contentX = (mouseX - rect.left) / oldScale;
+  const contentY = (mouseY - rect.top) / oldScale;
+  state.zoom = newZoom;
+  state.fitMode = false;
+  const newDisplayW = state.cols * newScale;
+  const newDisplayH = state.rows * newScale;
+  const viewCenterX = window.innerWidth / 2;
+  const viewCenterY = window.innerHeight / 2;
+  const newOffsetX = mouseX - viewCenterX + newDisplayW / 2 - contentX * newScale;
+  const newOffsetY = mouseY - viewCenterY + newDisplayH / 2 - contentY * newScale;
+
+  state.offsetX = newOffsetX;
+  state.offsetY = newOffsetY;
+
+  applyView();
+  updateZoomUI();
+}
+
+let isDragging = false;
+let dragStartX = 0, dragStartY = 0;
+let dragStartOffsetX = 0, dragStartOffsetY = 0;
+
+canvasEl.addEventListener('mousedown', (e) => {
+  if (!state.lines) return;
+  if (e.button !== 0) return;
+  e.preventDefault();
+  if (state.fitMode) {
+    state.fitMode = false;
+    state.offsetX = 0;
+    state.offsetY = 0;
+  }
+  isDragging = true;
+  dragStartX = e.clientX;
+  dragStartY = e.clientY;
+  dragStartOffsetX = state.offsetX;
+  dragStartOffsetY = state.offsetY;
+  canvasEl.style.cursor = 'grabbing';
+  canvasEl.style.transition = 'none';
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  e.preventDefault();
+  const dx = e.clientX - dragStartX;
+  const dy = e.clientY - dragStartY;
+  state.offsetX = dragStartOffsetX + dx;
+  state.offsetY = dragStartOffsetY + dy;
+  applyView();
+});
+
+window.addEventListener('mouseup', () => {
+  if (isDragging) {
+    isDragging = false;
+    canvasEl.style.cursor = '';
+    canvasEl.style.transition = 'transform 0.06s ease-out';
+  }
+});
+
+zoomSlider.addEventListener('input', (e) => {
+  if (!state.lines) return;
+  const val = parseInt(e.target.value, 10);
+  state.fitMode = false;
+  state.zoom = val / 100; 
+  state.offsetX = 0;
+  state.offsetY = 0;
+  applyView();
+  updateZoomUI();
+});
+
+zoomInBtn.addEventListener('click', () => {
+  if (!state.lines) return;
+  if (state.fitMode) {
+    state.fitMode = false;
+    state.zoom = 1.0;
+  }
+  state.zoom = Math.min(20.0, state.zoom * 1.2);
+  state.offsetX = 0;
+  state.offsetY = 0;
+  applyView();
+  updateZoomUI();
+});
+
+zoomOutBtn.addEventListener('click', () => {
+  if (!state.lines) return;
+  if (state.fitMode) {
+    state.fitMode = false;
+    state.zoom = 1.0;
+  }
+  state.zoom = Math.max(0.1, state.zoom / 1.2);
+  state.offsetX = 0;
+  state.offsetY = 0;
+  applyView();
+  updateZoomUI();
+});
+
+resetZoomBtn.addEventListener('click', () => {
+  if (!state.lines) return;
+  resetToFit();
+});
+
+fileInput.addEventListener("change", () => {
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => loadTxt(reader.result, f.name);
+  reader.readAsText(f, "utf-8");
+});
+
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => { e.preventDefault(); dragDepth++; dropEl.classList.add("show"); });
+window.addEventListener("dragover", (e) => { e.preventDefault(); });
+window.addEventListener("dragleave", (e) => {
+  e.preventDefault(); dragDepth--;
+  if (dragDepth <= 0) { dragDepth = 0; dropEl.classList.remove("show"); }
+});
+window.addEventListener("drop", (e) => {
+  e.preventDefault(); dragDepth = 0; dropEl.classList.remove("show");
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => loadTxt(reader.result, f.name);
+  reader.readAsText(f, "utf-8");
+});
+
+invertInput.addEventListener("change", () => {
+  state.invert = invertInput.checked;
+  if (state.lines) render();
+});
+
+canvasEl.addEventListener('wheel', handleWheel, { passive: false });
+canvasWrap.addEventListener('wheel', (e) => {
+  if (!state.lines) return;
+  if (e.target === canvasEl) return;
+  e.preventDefault();
+  const fakeEvent = {
+    preventDefault: () => {},
+    clientX: window.innerWidth / 2,
+    clientY: window.innerHeight / 2,
+    deltaY: e.deltaY,
+  };
+  if (state.fitMode) {
+    state.fitMode = false;
+    state.zoom = 1.0;
+    state.offsetX = 0;
+    state.offsetY = 0;
+  }
+}, { passive: false });
+
+window.addEventListener('resize', () => {
+  if (!state.lines) return;
+  if (state.fitMode) {
+    applyView();
+  } else {
+    applyView();
+  }
+});
+canvasEl.style.cursor = 'grab';
+</script>
+</body>
+</html>

@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>CART 字符画播放器</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #fff; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #cv {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    max-width: 100vw;
+    max-height: 100vh;
+    background: #000;
+  }
+  #ui {
+    position: fixed; top: 8px; left: 8px; right: 8px;
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    font-family: sans-serif; font-size: 12px; color: #ccc;
+    background: rgba(0,0,0,.65); padding: 6px 10px; border-radius: 6px;
+    z-index: 10;
+  }
+  #ui button { cursor: pointer; }
+  #status { margin-left: auto; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <input type="file" id="file" accept=".dat">
+  <button id="playBtn">播放</button>
+  <button id="pauseBtn">暂停</button>
+  <label>FPS <input type="number" id="fps" value="0" min="0" step="0.1" style="width:60px"></label>
+  <label>字符 <input type="number" id="cellPx" value="2" min="2" max="16" step="1" style="width:50px"></label>
+  <label><input type="checkbox" id="loop" checked> 循环</label>
+  <span id="status">等待 .dat…</span>
+</div>
+<canvas id="cv"></canvas>
+
+<script>
+"use strict";
+
+// ---------- 小端读 ----------
+const readU32 = (dv, off) => dv.getUint32(off, true);
+const readU16 = (dv, off) => dv.getUint16(off, true);
+const readF32 = (dv, off) => dv.getFloat32(off, true);
+
+// ---------- 解析 CART v1 ----------
+function parseDat(arrayBuffer) {
+  const dv = new DataView(arrayBuffer);
+  const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+  if (magic !== "CART") throw new Error("不是 CART 文件（magic=" + magic + "）");
+  let off = 4;
+  const ver = readU32(dv, off); off += 4;
+  if (ver !== 1) throw new Error("不支持的版本 " + ver);
+  const W = readU16(dv, off); off += 2;
+  const H = readU16(dv, off); off += 2;
+  const fps = readF32(dv, off); off += 4;
+  const nch = dv.getUint8(off); off += 1;
+  let charset = "";
+  for (let i = 0; i < nch; ++i) charset += String.fromCharCode(dv.getUint8(off + i));
+  off += nch;
+  const frameCount = readU32(dv, off); off += 4;
+  const dataStart = off;
+
+  const frameOffsets = new Uint32Array(frameCount);
+  const frameSizes = new Uint32Array(frameCount);
+  let p = dataStart;
+  for (let i = 0; i < frameCount; ++i) {
+    if (p + 4 > dv.byteLength) throw new Error("帧 " + i + " 头越界");
+    const sz = readU32(dv, p); p += 4;
+    if (p + sz > dv.byteLength) throw new Error("帧 " + i + " 数据越界");
+    frameOffsets[i] = p;
+    frameSizes[i] = sz;
+    p += sz;
+  }
+  return { W, H, fps, charset, frameCount, frameOffsets, frameSizes, dv };
+}
+
+// ---------- RLE 解码：3 字节 [u8 idx][u16 run LE] ----------
+function decodeFrame(dat, index, outGrid) {
+  const { W, H, frameOffsets, frameSizes, dv } = dat;
+  const start = frameOffsets[index];
+  const end = start + frameSizes[index];
+  let p = start;
+  let col = 0, row = 0;
+  const total = W * H;
+  let written = 0;
+  while (p + 3 <= end) {
+    const idx = dv.getUint8(p);
+    const run = dv.getUint16(p + 1, true);
+    p += 3;
+    if (run === 0) continue;
+    let remain = run;
+    while (remain > 0 && row < H) {
+      const can = Math.min(remain, W - col);
+      outGrid.fill(idx, row * W + col, row * W + col + can);
+      col += can;
+      remain -= can;
+      written += can;
+      if (col === W) { col = 0; ++row; }
+    }
+    if (row >= H) break;
+  }
+  if (written < total) outGrid.fill(0, written, total);
+}
+
+// ---------- 字形图集 ----------
+let glyphAtlas = null;
+let atlasCW = 0, atlasCH = 0;
+let atlasCharset = "";
+
+function buildGlyphAtlas(charset, CW, CH) {
+  const off = document.createElement("canvas");
+  off.width = CW; off.height = CH;
+  const ctx = off.getContext("2d", { willReadFrequently: true });
+  const fs = Math.max(6, Math.floor(CH * 0.95));
+  ctx.font = `${fs}px "Cascadia Mono", "Consolas", "Courier New", monospace`;
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#fff";
+  const atlas = new Array(charset.length);
+  for (let i = 0; i < charset.length; i++) {
+    ctx.clearRect(0, 0, CW, CH);
+    ctx.fillText(charset[i], 0, 0);
+    const img = ctx.getImageData(0, 0, CW, CH);
+    atlas[i] = new Uint32Array(new Uint32Array(img.data.buffer));
+  }
+  glyphAtlas = atlas;
+  atlasCW = CW; atlasCH = CH;
+  atlasCharset = charset;
+}
+
+// ---------- 状态 ----------
+const state = {
+  dat: null,
+  grid: null,
+  frameIndex: 0,
+  playing: false,
+  lastTime: 0,
+  acc: 0,
+  fpsOverride: 0,
+  loop: true,
+  rafId: 0,
+  cellPx: 2,
+  ctx: null,
+  imgData: null,
+  imgU32: null,
+  cw: 0, ch: 0, canvasW: 0, canvasH: 0,
+};
+
+const statusEl = document.getElementById("status");
+const fpsInput = document.getElementById("fps");
+const cellPxInput = document.getElementById("cellPx");
+const loopInput = document.getElementById("loop");
+const fileInput = document.getElementById("file");
+const playBtn = document.getElementById("playBtn");
+const pauseBtn = document.getElementById("pauseBtn");
+const canvasEl = document.getElementById("cv");
+
+// ---------- 建立 canvas / ImageData / 图集 ----------
+function setupRender(W, H, cellPx) {
+  const CW = cellPx, CH = cellPx;
+  state.cw = CW; state.ch = CH;
+  state.canvasW = W * CW;
+  state.canvasH = H * CH;
+
+  canvasEl.width = state.canvasW;
+  canvasEl.height = state.canvasH;
+
+  const ctx = canvasEl.getContext("2d", { alpha: false, desynchronized: true });
+  if (!ctx) { statusEl.textContent = "无法获取 2d context"; return false; }
+  ctx.imageSmoothingEnabled = false;
+  state.ctx = ctx;
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, state.canvasW, state.canvasH);
+
+  const img = ctx.createImageData(state.canvasW, state.canvasH);
+  const u32 = new Uint32Array(img.data.buffer);
+  u32.fill(0xFF000000);
+  state.imgData = img;
+  state.imgU32 = u32;
+
+  if (atlasCharset !== state.dat.charset || atlasCW !== CW || atlasCH !== CH) {
+    buildGlyphAtlas(state.dat.charset, CW, CH);
+  }
+  return true;
+}
+
+// ---------- 渲染 grid 到 ImageData 并上屏 ----------
+function renderGridToCanvas() {
+  const { W, H } = state.dat;
+  const CW = state.cw, CH = state.ch;
+  const canvasW = state.canvasW;
+  const grid = state.grid;
+  const out = state.imgU32;
+  const atlas = glyphAtlas;
+
+  for (let y = 0; y < H; y++) {
+    const rowBase = y * W;
+    const cyBase = y * CH;
+    for (let x = 0; x < W; x++) {
+      const g = atlas[grid[rowBase + x]] || atlas[0];
+      const cxBase = x * CW;
+      for (let gy = 0; gy < CH; gy++) {
+        const dst = (cyBase + gy) * canvasW + cxBase;
+        const src = gy * CW;
+        out.set(g.subarray(src, src + CW), dst);
+      }
+    }
+  }
+  state.ctx.putImageData(state.imgData, 0, 0);
+}
+
+function renderFrame(index) {
+  decodeFrame(state.dat, index, state.grid);
+  renderGridToCanvas();
+}
+
+// ---------- 播放循环 ----------
+function tick(nowMs) {
+  if (!state.playing || !state.dat) return;
+  const now = nowMs / 1000;
+  if (state.lastTime === 0) state.lastTime = now;
+  let dt = now - state.lastTime;
+  state.lastTime = now;
+  if (dt > 0.25) dt = 0.25;
+
+  const fps = state.fpsOverride > 0 ? state.fpsOverride : state.dat.fps;
+  const frameDur = 1 / (fps > 0 ? fps : 25);
+  state.acc += dt;
+
+  let advanced = false;
+  let catchUp = 3;
+  while (state.acc >= frameDur && catchUp-- > 0) {
+    state.acc -= frameDur;
+    state.frameIndex++;
+    if (state.frameIndex >= state.dat.frameCount) {
+      if (state.loop) state.frameIndex = 0;
+      else { state.frameIndex = state.dat.frameCount - 1; state.playing = false; break; }
+    }
+    advanced = true;
+  }
+  if (state.acc > frameDur * 5) state.acc = 0;
+
+  if (advanced) {
+    renderFrame(state.frameIndex);
+    updateStatus();
+  }
+  if (state.playing) state.rafId = requestAnimationFrame(tick);
+}
+
+function updateStatus() {
+  if (!state.dat) { statusEl.textContent = "等待 .dat…"; return; }
+  const d = state.dat;
+  const fps = state.fpsOverride > 0 ? state.fpsOverride : d.fps;
+  statusEl.textContent =
+    `${d.W}×${d.H} 字符 | ${fps.toFixed(2)} fps | 帧 ${state.frameIndex + 1}/${d.frameCount}` +
+    (state.playing ? " | 播放中" : " | 已暂停");
+}
+
+// ---------- 加载 ----------
+function loadDat(arrayBuffer, name) {
+  try {
+    const dat = parseDat(arrayBuffer);
+    state.dat = dat;
+    state.grid = new Uint8Array(dat.W * dat.H);
+    state.frameIndex = 0;
+    state.acc = 0;
+    state.lastTime = 0;
+    state.playing = false;
+    atlasCharset = ""; glyphAtlas = null;
+
+    if (!setupRender(dat.W, dat.H, state.cellPx)) return;
+    renderFrame(0);
+    updateStatus();
+
+    state.playing = true;
+    state.lastTime = 0;
+    if (state.rafId) cancelAnimationFrame(state.rafId);
+    state.rafId = requestAnimationFrame(tick);
+    console.log("loaded", name, dat.W + "x" + dat.H, dat.frameCount + " frames", dat.fps + " fps");
+  } catch (e) {
+    statusEl.textContent = "解析失败: " + e.message;
+    console.error(e);
+  }
+}
+
+// ---------- 同目录 out.dat ----------
+fetch("out.dat")
+  .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); })
+  .then(ab => loadDat(ab, "out.dat"))
+  .catch(err => {
+    statusEl.textContent = "未找到同目录 out.dat，请选择文件（" + err.message + "）";
+  });
+
+// ---------- 控件 ----------
+fileInput.addEventListener("change", () => {
+  const f = fileInput.files && fileInput.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => loadDat(reader.result, f.name);
+  reader.readAsArrayBuffer(f);
+});
+
+playBtn.addEventListener("click", () => {
+  if (!state.dat) return;
+  state.playing = true;
+  state.lastTime = 0;
+  state.acc = 0;
+  if (state.rafId) cancelAnimationFrame(state.rafId);
+  state.rafId = requestAnimationFrame(tick);
+  updateStatus();
+});
+pauseBtn.addEventListener("click", () => {
+  state.playing = false;
+  if (state.rafId) cancelAnimationFrame(state.rafId);
+  state.rafId = 0;
+  updateStatus();
+});
+fpsInput.addEventListener("change", () => {
+  state.fpsOverride = parseFloat(fpsInput.value) || 0;
+  updateStatus();
+});
+cellPxInput.addEventListener("change", () => {
+  const v = Math.max(2, Math.min(16, parseInt(cellPxInput.value, 10) || 2));
+  cellPxInput.value = v;
+  state.cellPx = v;
+  if (state.dat) {
+    setupRender(state.dat.W, state.dat.H, v);
+    renderFrame(state.frameIndex);
+  }
+});
+loopInput.addEventListener("change", () => { state.loop = loopInput.checked; });
+</script>
+</body>
+</html>
